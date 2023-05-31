@@ -1,4 +1,5 @@
-use wgpu::RenderPipelineDescriptor;
+use log::{error, info, debug};
+use wgpu::{util::DeviceExt};
 use winit::{
     dpi::PhysicalSize,
     event::*,
@@ -11,14 +12,13 @@ use wasm_bindgen::prelude::*;
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
 pub async fn run() {
-    cfg_if::cfg_if! {
-        if #[cfg(target_arch = "wasm32")] {
-            std::panic::set_hook(Box::new(console_error_panic_hook::hook));
-            console_log::init_with_level(log::Level::Warn).expect("Couldn't initialize logger");
-        } else {
-            env_logger::init();
-        }
+    #[cfg(target_arch = "wasm32")]
+    {
+        std::panic::set_hook(Box::new(console_error_panic_hook::hook));
+        console_log::init();
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    pretty_env_logger::init();
 
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
@@ -80,7 +80,7 @@ pub async fn run() {
                 Ok(_) => {}
                 Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
                 Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
-                Err(e) => eprintln!("{:?}", e),
+                Err(e) => error!("{:?}", e),
             }
         }
         Event::MainEventsCleared => {
@@ -90,6 +90,51 @@ pub async fn run() {
     });
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
+impl Vertex {
+    const ATTRIBS: [wgpu::VertexAttribute; 2] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+}
+
+const VERTICES: &[Vertex] = &[
+    Vertex {
+        position: [-0.0868241, 0.49240386, 0.0],
+        color: [0.5, 0.0, 0.5],
+    }, // A
+    Vertex {
+        position: [-0.49513406, 0.06958647, 0.0],
+        color: [0.5, 1.0, 0.5],
+    }, // B
+    Vertex {
+        position: [-0.21918549, -0.44939706, 0.0],
+        color: [0.5, 0.0, 0.5],
+    }, // C
+    Vertex {
+        position: [0.35966998, -0.3473291, 0.0],
+        color: [0.5, 0.0, 0.5],
+    }, // D
+    Vertex {
+        position: [0.44147372, 0.2347359, 0.0],
+        color: [0.5, 0.0, 0.5],
+    }, // E
+];
+
+const INDICES: &[u16] = &[0, 1, 4, 1, 2, 4, 2, 3, 4];
+
 struct State {
     surface: wgpu::Surface,
     device: wgpu::Device,
@@ -98,8 +143,10 @@ struct State {
     size: winit::dpi::PhysicalSize<u32>,
     window: Window,
     render_pipeline: wgpu::RenderPipeline,
-    challenge_render_pipeline: wgpu::RenderPipeline,
-    challenge_mode: bool,
+    vertex_buffer: wgpu::Buffer,
+    num_vertices: u32,
+    index_buffer: wgpu::Buffer,
+    num_indices: u32,
 }
 
 impl State {
@@ -122,9 +169,12 @@ impl State {
             .await
             .unwrap();
 
+        debug!("{:#?}", adapter.get_info());
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
+                    // enable NonFillPolygonMode feature for wireframe rendering
                     features: wgpu::Features::empty(),
                     limits: if cfg!(target_arch = "wasm32") {
                         wgpu::Limits::downlevel_webgl2_defaults()
@@ -144,7 +194,13 @@ impl State {
             .iter()
             .copied()
             .find(|f| f.is_srgb())
-            .unwrap_or(surface_caps.formats[0]);
+            .unwrap_or({
+                info!(
+                    "No srgb format found, defaulting to {:?}",
+                    surface_caps.formats[0]
+                );
+                surface_caps.formats[0]
+            });
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -157,7 +213,6 @@ impl State {
         surface.configure(&device, &config);
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
-        let challenge_shader = device.create_shader_module(wgpu::include_wgsl!("challenge.wgsl"));
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
@@ -171,7 +226,7 @@ impl State {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
-                buffers: &[],
+                buffers: &[Vertex::desc()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -203,41 +258,18 @@ impl State {
             multiview: None,
         });
 
-        let challenge_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor{
-            label: Some("Challenge Render Pipeline"),
-            layout: None,
-            vertex: wgpu::VertexState{
-                module: &challenge_shader,
-                entry_point: "vs_main",
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState{
-                module: &challenge_shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState{
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState{
-                topology:wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState{
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(VERTICES),
+            usage: wgpu::BufferUsages::VERTEX,
         });
-        let challenge_mode = false;
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Index Buffer"),
+            contents: bytemuck::cast_slice(INDICES),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let num_indices = INDICES.len() as u32;
+        let num_vertices = VERTICES.len() as u32;
 
         Self {
             surface,
@@ -247,8 +279,10 @@ impl State {
             size,
             window,
             render_pipeline,
-            challenge_render_pipeline,
-            challenge_mode,
+            vertex_buffer,
+            num_vertices,
+            index_buffer,
+            num_indices,
         }
     }
 
@@ -266,21 +300,7 @@ impl State {
     }
 
     fn input(&mut self, event: &WindowEvent) -> bool {
-        match event {
-            WindowEvent::KeyboardInput {
-                input:
-                    KeyboardInput {
-                        state,
-                        virtual_keycode: Some(VirtualKeyCode::Space),
-                        ..
-                    },
-                ..
-            } => {
-                self.challenge_mode = *state == ElementState::Pressed;
-                true
-            }
-            _ => false,
-        }
+        false
     }
 
     fn update(&mut self) {}
@@ -313,13 +333,10 @@ impl State {
                 })],
                 depth_stencil_attachment: None,
             });
-            if self.challenge_mode {
-                render_pass.set_pipeline(&self.challenge_render_pipeline);
-            } else {
-                render_pass.set_pipeline(&self.render_pipeline);
-            }
-            render_pass.draw(0..3, 0..1);
-
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
         // submit will accept anything that implements IntoIter
