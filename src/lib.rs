@@ -295,7 +295,9 @@ struct InstanceRaw {
 impl Instance {
     fn to_raw(&self) -> InstanceRaw {
         InstanceRaw {
-            model: (nalgebra::Matrix4::new_translation(&self.position) * nalgebra::Matrix4::from(self.rotation)).into(),
+            model: (nalgebra::Matrix4::new_translation(&self.position)
+                * nalgebra::Matrix4::from(self.rotation))
+            .into(),
         }
     }
 }
@@ -340,7 +342,194 @@ impl InstanceRaw {
     }
 }
 
+struct DepthPass {
+    texture: texture::Texture,
+    layout: wgpu::BindGroupLayout,
+    bind_group: wgpu::BindGroup,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    num_depth_indices: u32,
+    render_pipeline: wgpu::RenderPipeline,
+}
 
+impl DepthPass {
+    fn new(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) ->Self{
+        let texture = texture::Texture::create_depth_texture_non_comparison_sampler(device, config, "depth_texture");
+
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("depth_texture_bind_group_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+            ],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&texture.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&texture.sampler),
+                },
+            ],
+            label: Some("depth_pass.bind_group"),
+        });
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Depth Pass VB"),
+            contents: bytemuck::cast_slice(DEPTH_VERTICES),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Depth Pass IB"),
+            contents: bytemuck::cast_slice(DEPTH_INDICES),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Depth Pass Pipeline Layout"),
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Shadow Display Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("depth_pass.wgsl").into()),
+        });
+
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Depth Pass Render Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[Vertex::desc()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent::REPLACE,
+                        alpha: wgpu::BlendComponent::REPLACE,
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                // Setting this to anything other than Fill requires Features::POLYGON_MODE_LINE
+                // or Features::POLYGON_MODE_POINT
+                polygon_mode: wgpu::PolygonMode::Fill,
+                // Requires Features::DEPTH_CLIP_CONTROL
+                unclipped_depth: false,
+                // Requires Features::CONSERVATIVE_RASTERIZATION
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            // If the pipeline will be used with a multiview render pass, this
+            // indicates how many array layers the attachments will have.
+            multiview: None,
+        });
+
+        Self {
+            texture,
+            layout,
+            bind_group,
+            vertex_buffer,
+            index_buffer,
+            num_depth_indices: DEPTH_INDICES.len() as u32,
+            render_pipeline
+        }
+    }
+    fn resize(&mut self, device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) {
+        self.texture = texture::Texture::create_depth_texture_non_comparison_sampler(device, config, "depth_texture");
+        self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.texture.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.texture.sampler),
+                },
+            ],
+            label: Some("depth_pass.bind_group"),
+        });
+    }
+
+    fn render(&self, view: &wgpu::TextureView, encoder: &mut wgpu::CommandEncoder) {
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Depth Visual Render Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: true,
+                },
+            })],
+            depth_stencil_attachment: None,
+        });
+        render_pass.set_pipeline(&self.render_pipeline);
+        render_pass.set_bind_group(0, &self.bind_group, &[]);
+        render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+        render_pass.draw_indexed(0..self.num_depth_indices, 0, 0..1);
+    }
+}
+
+const DEPTH_VERTICES: &[Vertex] = &[
+    Vertex {
+        position: [0.0, 0.0, 0.0],
+        tex_coords: [0.0, 1.0]
+    },
+    Vertex {
+        position: [1.0, 0.0, 0.0],
+        tex_coords: [1.0, 1.0]
+    },
+    Vertex {
+        position: [1.0, 1.0, 0.0],
+        tex_coords: [1.0, 0.0]
+    },
+    Vertex {
+        position: [0.0, 1.0, 0.0],
+        tex_coords: [0.0, 0.0]
+    },
+];
+
+const DEPTH_INDICES: &[u16] = &[
+    0, 1, 2,
+    2, 3, 0,
+];
 
 struct State {
     surface: wgpu::Surface,
@@ -364,6 +553,7 @@ struct State {
     model_transform_buffer: wgpu::Buffer,
     instances: Vec<Instance>,
     instance_buffer: wgpu::Buffer,
+    depth_pass: DepthPass,
 }
 
 impl State {
@@ -432,7 +622,8 @@ impl State {
         let diffuse_bytes = include_bytes!("happy-human.jpeg");
 
         let diffuse_texture =
-            texture::Texture::from_bytes(&device, &queue, diffuse_bytes, "happy-human.jpeg").unwrap();
+            texture::Texture::from_bytes(&device, &queue, diffuse_bytes, "happy-human.jpeg")
+                .unwrap();
 
         let texture_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -489,7 +680,7 @@ impl State {
         let num_indices = INDICES.len() as u32;
 
         let camera = Camera {
-            eye: nalgebra::Point3::new(0.0, 1.0, 2.0),
+            eye: nalgebra::Point3::new(0.0, 1.0, -10.0),
             target: nalgebra::Point3::new(0.0, 0.0, 0.0),
             up: nalgebra::Vector3::y(),
             aspect: config.width as f32 / config.height as f32,
@@ -557,6 +748,7 @@ impl State {
             label: Some("vertex_bind_group"),
         });
 
+
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
@@ -577,7 +769,10 @@ impl State {
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    blend: Some(wgpu::BlendState{
+                        color: wgpu::BlendComponent::REPLACE,
+                        alpha: wgpu::BlendComponent::REPLACE,
+                    }),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -593,7 +788,17 @@ impl State {
                 // Requires Features::CONSERVATIVE_RASTERIZATION
                 conservative: false,
             },
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: texture::Texture::DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less, // 1.
+                stencil: wgpu::StencilState::default(),     // 2.
+                bias: wgpu::DepthBiasState {
+                    constant: 2, // Corresponds to bilinear filtering
+                    slope_scale: 2.0,
+                    clamp: 0.0,
+                },
+            }),
             multisample: wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
@@ -639,6 +844,8 @@ impl State {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
+        
+        let depth_pass = DepthPass::new(&device, &config);
 
         Self {
             surface,
@@ -662,6 +869,7 @@ impl State {
             model_transform_buffer,
             instances,
             instance_buffer,
+            depth_pass,
         }
     }
 
@@ -675,6 +883,7 @@ impl State {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+            self.depth_pass.resize(&self.device, &self.config);
             self.camera.aspect = self.config.width as f32 / self.config.height as f32;
             self.camera.build_view_projection_matrix();
         }
@@ -727,7 +936,14 @@ impl State {
                         store: true,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_pass.texture.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: true,
+                    }),
+                    stencil_ops: None,
+                }),
             });
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
@@ -738,6 +954,7 @@ impl State {
             render_pass.draw_indexed(0..self.num_indices, 0, 0..self.instances.len() as _);
         }
 
+        self.depth_pass.render(&view, &mut encoder);
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
